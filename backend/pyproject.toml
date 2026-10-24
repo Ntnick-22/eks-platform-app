@@ -1,0 +1,15 @@
+# Ruff = linter + formatter. The same rules run in VS Code, locally and in CI (the test job).
+[tool.ruff]
+line-length = 100 # the default 88 would re-wrap most of the SQL strings
+target-version = "py312" # matches python:3.12-slim
+
+[tool.ruff.lint]
+# Listed explicitly instead of relying on ruff's defaults, which change between versions
+select = [
+  "E4", "E7", "E9", # pycodestyle: real errors (imports, statements, syntax), not style nitpicks
+  "F",              # pyflakes: unused imports/variables, undefined names
+  "I",              # import sorting
+  "SIM",            # simplifications (e.g. combined with statements)
+  "BLE",            # no blind "except Exception"
+  "RUF",            # ruff's own checks (e.g. stale noqa comments)
+]

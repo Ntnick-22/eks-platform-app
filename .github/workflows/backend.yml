@@ -1,0 +1,242 @@
+name: backend
+
+# All checks run on every PR and on main. Only main pushes the image and deploys to dev:
+#   test (lint, secrets, Dockerfile, pytest + coverage)
+#   → image (build arm64, Trivy, container smoke test with Kubernetes-like security flags, push to ECR)
+#   → deploy-dev (commit the new tag to the gitops repo; Argo CD syncs, then runs the PostSync smoke Job)
+on:
+  push:
+    branches: [main]
+    paths: ["backend/**", ".github/workflows/backend.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["backend/**", ".github/workflows/backend.yml"]
+  workflow_dispatch: # rebuild/redeploy the current main
+
+permissions:
+  contents: read # default for every job; jobs that talk to AWS add id-token
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: myeks/backend
+  GITOPS_REPO: Ntnick-22/eks-platform-gitops
+  # Tool images pinned by version AND digest (multi-arch indexes: they run on the arm64 runner too).
+  # A re-pushed or hijacked tag cannot swap in a different tool.
+  TRIVY_IMAGE: aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  HADOLINT_IMAGE: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
+  POSTGRES_IMAGE: postgres:17-alpine@sha256:eee6c6e1b0894fa4fe0075eb054af9fd1cf39a35321c2d4110626cfe506411fb
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: backend
+    # Throwaway Postgres next to the runner, same major version as dev (postgres-dev) and RDS.
+    # Published on 5433 so the defaults in tests/conftest.py work unchanged.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # gitleaks scans the whole history, not only the last commit
+
+      # Public repo: a committed key is public within seconds. Runs as the runner user so git
+      # inside the container trusts the checkout ("dubious ownership" otherwise).
+      - name: Secret scan (gitleaks)
+        working-directory: .
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" "$GITLEAKS_IMAGE" \
+            git --redact --verbose --exit-code 1 /repo
+
+      - name: Dockerfile lint (hadolint)
+        run: docker run --rm -i "$HADOLINT_IMAGE" hadolint --failure-threshold warning - < Dockerfile
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12" # same minor version as the python:3.12-slim image
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # Cheapest checks first: a lint or formatting problem fails in seconds
+      - name: Lint (ruff check)
+        run: ruff check --output-format=github .
+
+      - name: Check formatting (ruff format)
+        run: ruff format --check --diff .
+
+      # Against a real Postgres (no mocks): SQL typos and constraint errors only show up there.
+      # Coverage gate: untested code fails the build. Raise the bar as tests grow.
+      - name: Run tests (with coverage gate)
+        run: pytest -v --cov=app --cov-report=term-missing --cov-fail-under=80
+
+  image:
+    needs: test # a red test means nothing is built, pushed or deployed
+    # Native arm64 runner = same CPU architecture as our Graviton nodes, no QEMU emulation
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      id-token: write # OIDC token → AWS role (main only: the role trusts refs/heads/main)
+    # Only the tag crosses jobs: GitHub drops outputs containing a masked value (the account ID)
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Image tag = short commit SHA (immutable in ECR)
+        id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build (linux/arm64)
+        run: docker build --provenance=false -t "backend:${{ steps.meta.outputs.tag }}" .
+
+      # Fails only on HIGH/CRITICAL findings that HAVE a fix (unfixed OS CVEs have nothing to upgrade to)
+      - name: Scan the image (Trivy)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" \
+            image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress \
+            "backend:${{ steps.meta.outputs.tag }}"
+
+      # Run the built image the way the cluster will: non-root uid, read-only root filesystem
+      # with only /tmp writable, no capabilities, no privilege escalation. An image that breaks
+      # under these rules fails here, not as a CrashLoopBackOff in the cluster.
+      - name: Container smoke test (Kubernetes-like security flags)
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          docker network create smoke
+          docker run -d --name db --network smoke \
+            -e POSTGRES_DB=app -e POSTGRES_USER=app -e POSTGRES_PASSWORD=smoke "$POSTGRES_IMAGE"
+          docker run -d --name backend --network smoke -p 8000:8000 \
+            --read-only --tmpfs /tmp --user 10001:10001 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -e DB_HOST=db -e DB_PORT=5432 -e POSTGRES_DB=app -e POSTGRES_USER=app -e POSTGRES_PASSWORD=smoke \
+            "backend:$TAG"
+          # Same budget as the startupProbe: init_db() waits up to ~60 s for the database
+          for i in $(seq 1 45); do
+            curl -fsS http://localhost:8000/api/ready > /dev/null && break
+            sleep 2
+          done
+          curl -fsS http://localhost:8000/api/ready
+          curl -fsS http://localhost:8000/api/health | grep -q '"database":"connected"'
+          echo "smoke test passed"
+
+      - name: Logs of the smoke-test containers
+        if: failure()
+        run: docker logs backend; docker logs db
+
+      - name: Configure AWS credentials (OIDC)
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_APP_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-app-${{ github.run_id }}
+          mask-aws-account-id: true
+
+      - name: Log in to ECR
+        if: github.ref == 'refs/heads/main'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Push stays simple: the image that passed every check above is retagged, never rebuilt.
+      # Immutable tags: a re-run of the same commit reuses the image already in ECR.
+      - name: Push to ECR
+        if: github.ref == 'refs/heads/main'
+        run: |
+          REPO="${{ steps.ecr.outputs.registry }}/$ECR_REPOSITORY"
+          TAG="${{ steps.meta.outputs.tag }}"
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" > /dev/null 2>&1; then
+            echo "$ECR_REPOSITORY:$TAG already in ECR, not pushing again"
+          else
+            docker tag "backend:$TAG" "$REPO:$TAG"
+            docker push "$REPO:$TAG"
+          fi
+
+  deploy-dev:
+    needs: image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # own short-lived credentials, only to resolve the ECR registry URI
+    # One writer at a time on the gitops repo; never cancel a half-done commit
+    concurrency:
+      group: gitops-dev
+      cancel-in-progress: false
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_APP_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-app-deploy-${{ github.run_id }}
+          mask-aws-account-id: true
+
+      - name: Resolve the image repository URI
+        id: repo
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "uri=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      # Write deploy key: can push to the gitops repo only (no access to anything else)
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          path: gitops
+
+      # Argo CD reads .argocd-source-<app>.yaml next to the chart and overrides the values.
+      # CI only ever touches this one file, so it never conflicts with people editing values.
+      - name: Point backend-dev at the new image
+        working-directory: gitops
+        env:
+          REPOSITORY: ${{ steps.repo.outputs.uri }} # same job: step outputs are not dropped
+          TAG: ${{ needs.image.outputs.tag }}
+        run: |
+          cat > helm-charts/backend/.argocd-source-backend-dev.yaml <<EOF
+          # Written by eks-platform-app CI (backend.yml) on every build of main. Do not edit by hand.
+          helm:
+            parameters:
+              - name: image.repository
+                value: ${REPOSITORY}
+                forcestring: true
+              - name: image.tag
+                value: "${TAG}"
+                forcestring: true
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add helm-charts/backend/.argocd-source-backend-dev.yaml
+          if git diff --cached --quiet; then
+            echo "backend-dev already runs $TAG"
+            exit 0
+          fi
+          git commit -m "deploy: backend $TAG to dev" -m "From ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          # Another writer may have pushed meanwhile: rebase and retry
+          for i in 1 2 3; do
+            git push && exit 0
+            git pull --rebase
+          done
+          exit 1

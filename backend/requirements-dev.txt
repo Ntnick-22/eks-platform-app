@@ -1,0 +1,5 @@
+# Test-only dependencies: installed in CI's test job, never in the production image
+-r requirements.txt
+pytest==8.3.3
+pytest-cov==7.1.0 # coverage gate in CI (--cov-fail-under)
+ruff==0.17.0
