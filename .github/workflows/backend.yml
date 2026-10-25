@@ -84,9 +84,9 @@ jobs:
         run: ruff format --check --diff .
 
       # Against a real Postgres (no mocks): SQL typos and constraint errors only show up there.
-      # Coverage gate: untested code fails the build. Raise the bar as tests grow.
+      # Coverage gate: untested code fails the build (93% on 2026-10-24; gate 90 leaves headroom).
       - name: Run tests (with coverage gate)
-        run: pytest -v --cov=app --cov-report=term-missing --cov-fail-under=80
+        run: pytest -v --cov=app --cov-report=term-missing --cov-fail-under=90
 
   image:
     needs: test # a red test means nothing is built, pushed or deployed
