@@ -68,6 +68,8 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           FILE="helm-charts/${APP}/.argocd-source-${APP}-dev.yaml"
+          # A new service can build before its chart lands; the tag then waits there for it
+          mkdir -p "$(dirname "$FILE")"
           cat > "$FILE" <<EOF
           # Written by eks-platform-app CI on every build of main. Do not edit by hand.
           helm:
