@@ -1,0 +1,148 @@
+name: frontend
+
+# All checks run on every PR and on main. Only main pushes the image and deploys to dev:
+#   test (hadolint, eslint, npm audit, Vitest)
+#   → image (build arm64, Trivy, container smoke test with Kubernetes-like security flags, push to ECR)
+#   → deploy-dev (reusable: commit the new tag to the gitops repo; Argo CD syncs)
+on:
+  push:
+    branches: [main]
+    paths: ["frontend/**", ".github/workflows/frontend.yml", ".github/workflows/_deploy-dev.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["frontend/**", ".github/workflows/frontend.yml", ".github/workflows/_deploy-dev.yml"]
+  workflow_dispatch: # rebuild/redeploy the current main
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: myeks/frontend
+  # Tool images pinned by version AND digest (multi-arch: they run on the arm64 runner too)
+  TRIVY_IMAGE: aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+  HADOLINT_IMAGE: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Dockerfile lint (hadolint)
+        run: docker run --rm -i "$HADOLINT_IMAGE" hadolint --failure-threshold warning - < Dockerfile
+
+      # Stage 1 only: Node + node_modules (npm ci proves package.json and the lockfile agree).
+      # Lint, audit and tests run inside it, so Node never has to be set up on the runner.
+      - name: Build the build stage
+        run: docker build --provenance=false --target build -t frontend-deps .
+
+      # Cheapest checks first
+      - name: Lint (eslint)
+        run: docker run --rm frontend-deps npm run lint
+
+      - name: Audit dependencies (fail on high or critical)
+        run: docker run --rm frontend-deps npm audit --audit-level=high
+
+      # Components rendered in jsdom against a mocked API: status, users, register success and 409
+      - name: Unit tests (Vitest)
+        run: docker run --rm frontend-deps npm test
+
+  image:
+    needs: test # a red check means nothing is built, pushed or deployed
+    # Native arm64 runner = same CPU architecture as our Graviton nodes, no QEMU emulation
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      id-token: write # OIDC token → AWS role (main only: the role trusts refs/heads/main)
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Image tag = short commit SHA (immutable in ECR)
+        id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build (linux/arm64)
+        run: docker build --provenance=false -t "frontend:${{ steps.meta.outputs.tag }}" .
+
+      # Fails only on HIGH/CRITICAL findings that HAVE a fix (unfixed OS CVEs have nothing to upgrade to)
+      - name: Scan the image (Trivy)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" \
+            image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress \
+            "frontend:${{ steps.meta.outputs.tag }}"
+
+      # Run the built image the way the cluster will: non-root, read-only root filesystem with
+      # only /tmp writable, no capabilities. Then check what users and the ALB will rely on.
+      - name: Container smoke test (Kubernetes-like security flags)
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          docker run -d --name frontend -p 8080:8080 \
+            --read-only --tmpfs /tmp --user 101:101 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            "frontend:$TAG"
+          for i in $(seq 1 15); do
+            curl -fsS http://localhost:8080/healthz > /dev/null && break
+            sleep 1
+          done
+          curl -fsS http://localhost:8080/healthz
+          # The app shell, with its security headers and no caching (users get new asset names after a deploy)
+          curl -fsS -D headers.txt -o index.html http://localhost:8080/
+          grep -q '<div id="root">' index.html
+          grep -qi '^x-content-type-options: nosniff' headers.txt
+          grep -qi '^cache-control: no-cache' headers.txt
+          # A client-side route falls back to the app instead of 404
+          curl -fsS http://localhost:8080/some/route | grep -q '<div id="root">'
+          echo "smoke test passed"
+
+      - name: Logs of the smoke-test container
+        if: failure()
+        run: docker logs frontend
+
+      - name: Configure AWS credentials (OIDC)
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_APP_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-app-${{ github.run_id }}
+          mask-aws-account-id: true
+
+      - name: Log in to ECR
+        if: github.ref == 'refs/heads/main'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # The image that passed every check above is retagged, never rebuilt
+      - name: Push to ECR
+        if: github.ref == 'refs/heads/main'
+        run: |
+          REPO="${{ steps.ecr.outputs.registry }}/$ECR_REPOSITORY"
+          TAG="${{ steps.meta.outputs.tag }}"
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" > /dev/null 2>&1; then
+            echo "$ECR_REPOSITORY:$TAG already in ECR, not pushing again"
+          else
+            docker tag "frontend:$TAG" "$REPO:$TAG"
+            docker push "$REPO:$TAG"
+          fi
+
+  deploy-dev:
+    needs: image
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-dev.yml
+    with:
+      app: frontend
+      tag: ${{ needs.image.outputs.tag }}
+    secrets: inherit

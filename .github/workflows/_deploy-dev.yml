@@ -1,0 +1,95 @@
+name: deploy-dev (reusable)
+
+# Shared last step of every service pipeline: point <app>-dev at the image CI just pushed,
+# by committing .argocd-source-<app>-dev.yaml to the gitops repo. Argo CD does the rest.
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: "Service name = chart folder and ECR repository suffix (backend, frontend)"
+        type: string
+        required: true
+      tag:
+        description: "Image tag (short commit SHA) already pushed to ECR"
+        type: string
+        required: true
+    secrets:
+      AWS_APP_CI_ROLE_ARN:
+        required: true
+      GITOPS_DEPLOY_KEY:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: eu-west-1
+  GITOPS_REPO: Ntnick-22/eks-platform-gitops
+
+jobs:
+  deploy-dev:
+    runs-on: ubuntu-24.04
+    # One writer at a time on the gitops repo (all services share it); never cancel a half-done commit
+    concurrency:
+      group: gitops-dev
+      cancel-in-progress: false
+    steps:
+      # Own short-lived credentials, only to resolve the ECR registry URI: a job output carrying
+      # the (masked) account ID would be dropped by GitHub
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_APP_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-app-deploy-${{ github.run_id }}
+          mask-aws-account-id: true
+
+      - name: Resolve the image repository URI
+        id: repo
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "uri=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/myeks/${{ inputs.app }}" >> "$GITHUB_OUTPUT"
+
+      # Write deploy key: can push to the gitops repo only (no access to anything else)
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          path: gitops
+
+      # Argo CD reads .argocd-source-<application>.yaml next to the chart and overrides the values.
+      # CI only ever touches this one file, so it never conflicts with people editing values.
+      - name: Point ${{ inputs.app }}-dev at the new image
+        working-directory: gitops
+        env:
+          APP: ${{ inputs.app }}
+          REPOSITORY: ${{ steps.repo.outputs.uri }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          FILE="helm-charts/${APP}/.argocd-source-${APP}-dev.yaml"
+          cat > "$FILE" <<EOF
+          # Written by eks-platform-app CI on every build of main. Do not edit by hand.
+          helm:
+            parameters:
+              - name: image.repository
+                value: ${REPOSITORY}
+                forcestring: true
+              - name: image.tag
+                value: "${TAG}"
+                forcestring: true
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$FILE"
+          if git diff --cached --quiet; then
+            echo "${APP}-dev already runs $TAG"
+            exit 0
+          fi
+          git commit -m "deploy: ${APP} $TAG to dev" -m "From ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          # Another writer may have pushed meanwhile: rebase and retry
+          for i in 1 2 3; do
+            git push && exit 0
+            git pull --rebase
+          done
+          exit 1
