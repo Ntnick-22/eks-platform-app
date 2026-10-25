@@ -1,0 +1,30 @@
+name: repo-checks
+
+# Checks for the whole repository, on every PR and push: no path filter, so a secret
+# committed anywhere (docs, scripts, a new service) is caught, not only in backend/ or frontend/.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+
+jobs:
+  secrets:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the whole history, not only the last commit
+
+      # Public repo: a committed key is public within seconds. Runs as the runner user so git
+      # inside the container trusts the checkout ("dubious ownership" otherwise).
+      - name: Secret scan (gitleaks)
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" "$GITLEAKS_IMAGE" \
+            git --redact --verbose --exit-code 1 /repo
