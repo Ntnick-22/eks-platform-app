@@ -88,7 +88,7 @@ export default function App() {
     <main className="page">
       <nav className="nav">
         <div>
-          <div className="brandTitle">eks-platform demo v2</div>
+          <div className="brandTitle">eks-platform demo v3</div>
           <div className="brandSubtitle">Three-tier app on AWS EKS (GitOps)</div>
         </div>
         <div className="statusPill">{health}</div>
