@@ -2,10 +2,42 @@ import os
 import time
 
 import psycopg2
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
+
+# Prometheus metrics, scraped from /metrics (ServiceMonitor in the gitops chart). Labelled by the
+# route template (/api/users), never the raw URL: one series per endpoint, not per request path.
+# One gunicorn worker, so the default in-process registry is enough. With "-w N" every worker
+# would count on its own: that needs prometheus_client's multiprocess mode.
+REQUESTS = Counter("http_requests_total", "HTTP requests", ["method", "endpoint", "status"])
+LATENCY = Histogram(
+    "http_request_duration_seconds", "HTTP request duration", ["method", "endpoint"]
+)
+
+
+@app.before_request
+def start_timer():
+    g.start = time.perf_counter()
+
+
+@app.after_request
+def record_request(response):
+    # Also runs for error responses (404, the 503 handler below, unhandled 500s)
+    endpoint = request.url_rule.rule if request.url_rule else "unmatched"
+    if endpoint != "/metrics":  # Prometheus' own scrapes would drown the real traffic
+        LATENCY.labels(request.method, endpoint).observe(time.perf_counter() - g.start)
+        REQUESTS.labels(request.method, endpoint, str(response.status_code)).inc()
+    return response
+
+
+# Not public: the Ingress only routes /api/* to the backend
+@app.get("/metrics")
+def metrics():
+    return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+
 
 # Required config has NO defaults: a missing or misspelled variable crashes the app at startup,
 # so the new pod never becomes ready and the rollout stops while the old pods keep serving

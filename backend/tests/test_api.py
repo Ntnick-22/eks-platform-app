@@ -107,3 +107,17 @@ def test_ready_fails_when_database_is_down(db_down):
     r = db_down.get("/api/ready")
     assert r.status_code == 503
     assert r.get_json() == {"error": "Database unavailable"}
+
+
+def test_metrics_count_requests_by_route_template(client):
+    client.get("/api/health")
+    client.get("/api/does-not-exist")
+    body = client.get("/metrics").get_data(as_text=True)
+    assert 'http_requests_total{endpoint="/api/health",method="GET",status="200"}' in body
+    assert 'endpoint="unmatched",method="GET",status="404"' in body
+    assert 'http_request_duration_seconds_bucket{endpoint="/api/health"' in body
+
+
+def test_metrics_scrapes_are_not_counted(client):
+    client.get("/metrics")
+    assert 'endpoint="/metrics"' not in client.get("/metrics").get_data(as_text=True)
