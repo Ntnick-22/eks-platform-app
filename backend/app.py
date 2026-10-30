@@ -1,4 +1,5 @@
 import os
+import random
 import time
 
 import psycopg2
@@ -21,6 +22,33 @@ LATENCY = Histogram(
 @app.before_request
 def start_timer():
     g.start = time.perf_counter()
+
+
+# Fault injection for release drills: a canary analysis must catch a bad version, so a version
+# can be made bad on purpose. A share of API requests fails with 500 and/or answers slowly.
+# Off unless set. Probes and /metrics are never affected, like a real bug that passes the
+# health checks: Kubernetes keeps the pod, only the canary analysis can stop the release.
+def read_fault_config(env):
+    error_rate = float(env.get("FAULT_ERROR_RATE", "0"))
+    latency_seconds = float(env.get("FAULT_LATENCY_SECONDS", "0"))
+    if not 0 <= error_rate <= 1 or latency_seconds < 0:
+        raise ValueError("FAULT_ERROR_RATE must be 0..1 and FAULT_LATENCY_SECONDS >= 0")
+    return error_rate, latency_seconds
+
+
+FAULT_ERROR_RATE, FAULT_LATENCY_SECONDS = read_fault_config(os.environ)
+FAULT_EXEMPT_PATHS = {"/api/health", "/api/ready", "/metrics"}
+
+
+@app.before_request
+def inject_faults():
+    if request.path in FAULT_EXEMPT_PATHS:
+        return None
+    if FAULT_LATENCY_SECONDS:
+        time.sleep(FAULT_LATENCY_SECONDS)
+    if FAULT_ERROR_RATE and random.random() < FAULT_ERROR_RATE:
+        return jsonify({"error": "Injected fault"}), 500
+    return None
 
 
 @app.after_request
