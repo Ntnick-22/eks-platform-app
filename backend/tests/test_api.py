@@ -121,3 +121,44 @@ def test_metrics_count_requests_by_route_template(client):
 def test_metrics_scrapes_are_not_counted(client):
     client.get("/metrics")
     assert 'endpoint="/metrics"' not in client.get("/metrics").get_data(as_text=True)
+
+
+# ── Fault injection (release drills): makes a version bad on purpose for the canary analysis ──
+
+
+def test_faults_are_off_by_default():
+    assert backend.read_fault_config({}) == (0.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{"FAULT_ERROR_RATE": "1.5"}, {"FAULT_ERROR_RATE": "-0.1"}, {"FAULT_LATENCY_SECONDS": "-1"}],
+)
+def test_fault_config_out_of_range_fails_at_startup(env):
+    with pytest.raises(ValueError):
+        backend.read_fault_config(env)
+
+
+def test_fault_error_rate_fails_api_requests_and_counts_them(client, monkeypatch):
+    monkeypatch.setattr(backend, "FAULT_ERROR_RATE", 1.0)
+    r = client.get("/api/users")
+    assert r.status_code == 500
+    assert r.get_json() == {"error": "Injected fault"}
+    body = client.get("/metrics").get_data(as_text=True)
+    assert 'http_requests_total{endpoint="/api/users",method="GET",status="500"}' in body
+
+
+def test_faults_never_touch_probes_or_metrics(client, monkeypatch):
+    monkeypatch.setattr(backend, "FAULT_ERROR_RATE", 1.0)
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/api/ready").status_code == 200
+    assert client.get("/metrics").status_code == 200
+
+
+def test_fault_latency_delays_api_requests(client, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(backend, "FAULT_LATENCY_SECONDS", 0.25)
+    monkeypatch.setattr(backend.time, "sleep", sleeps.append)
+    client.get("/api/users")
+    client.get("/api/health")
+    assert sleeps == [0.25]
